@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -7,11 +8,7 @@ namespace AsyncEventAggregator
 {
     public sealed class AsyncEventHub
     {
-        private const string EventTypeNotFoundExceptionMessage = @"Event type not found!";
-        private const string SubscribersNotFoundExceptionMessage = @"Subscribers not found!";
-        private const string FailedToAddSubscribersExceptionMessage = @"Failed to add subscribers!";
         private const string FailedToGetEventHandlerTaskFactoriesExceptionMessage = @"Failed to get event handler task factories!";
-        private const string FailedToAddEventHandlerTaskFactoriesExceptionMessage = @"Failed to add event handler task factories!";
         private const string FailedToGetSubscribersExceptionMessage = @"Failed to get subscribers!";
         private const string FailedToRemoveEventHandlerTaskFactories = @"Failed to remove event handler task factories!";
 
@@ -29,204 +26,149 @@ namespace AsyncEventAggregator
             _hub = new ConcurrentDictionary<Type, ConcurrentDictionary<object, ConcurrentBag<object>>>();
         }
 
+        /// <summary>
+        ///     Publishes an event.
+        /// </summary>
+        /// <typeparam name="TEvent">Event type.</typeparam>
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="eventDataTask">An event data.</param>
+        /// <returns>Subscriber's asynchronous replies.</returns>
+        /// <exception cref="T:System.ArgumentNullException">
+        ///     <paramref name="sender" /> is a null reference (Nothing in Visual Basic).-or-
+        ///     <paramref name="eventDataTask" />
+        ///     is a null reference (Nothing in Visual Basic).
+        /// </exception>
         public Task<Task[]> Publish<TEvent>(object sender, Task<TEvent> eventDataTask)
         {
             var taskCompletionSource = new TaskCompletionSource<Task[]>();
 
-            _factory.StartNew(
-                () =>
-                    {
-                        Type eventType = typeof (TEvent);
+            if (sender == null)
+            {
+                taskCompletionSource.SetException(new ArgumentNullException("sender"));
+                return taskCompletionSource.Task;
+            }
 
-                        if (_hub.ContainsKey(eventType))
-                        {
-                            ConcurrentDictionary<object, ConcurrentBag<object>> subscribers;
+            if (eventDataTask == null)
+            {
+                taskCompletionSource.SetException(new ArgumentNullException("eventDataTask"));
+                return taskCompletionSource.Task;
+            }
+            Type eventType = typeof (TEvent);
 
-                            if (_hub.TryGetValue(eventType, out subscribers))
-                            {
-                                if (subscribers.Count > 0)
+            ConcurrentDictionary<object, ConcurrentBag<object>> subscribers;
+
+            if (_hub.TryGetValue(eventType, out subscribers) && subscribers.Count > 0)
+            {
+                // Executes event handlers for all receivers except sender
+                _factory.ContinueWhenAll(
+                    new List<Task>(
+                        new List<object>(subscribers.Keys)
+                            .Where(p => p != sender)
+                            .Select(p =>
                                 {
-                                    _factory.ContinueWhenAll(
-                                        new ConcurrentBag<Task>(
-                                            new ConcurrentBag<object>(subscribers.Keys)
-                                                .Where(p => p != sender && subscribers.ContainsKey(p))
-                                                .Select(p =>
-                                                    {
-                                                        ConcurrentBag<object> eventHandlerTaskFactories;
+                                    ConcurrentBag<object> eventHandlerTaskFactories;
 
-                                                        bool isFailed = !subscribers.TryGetValue(p, out eventHandlerTaskFactories);
+                                    // Try to get event handlers
+                                    if (!subscribers.TryGetValue(p, out eventHandlerTaskFactories) || eventHandlerTaskFactories == null)
+                                    {
+                                        return null;
+                                    }
 
-                                                        return new
-                                                            {
-                                                                IsFailed = isFailed,
-                                                                EventHandlerTaskFactories = eventHandlerTaskFactories
-                                                            };
-                                                    })
-                                                .SelectMany(
-                                                    p =>
-                                                        {
-                                                            if (p.IsFailed)
-                                                            {
-                                                                var innerTaskCompletionSource = new TaskCompletionSource<Task>();
-                                                                innerTaskCompletionSource.SetException(new Exception(FailedToGetEventHandlerTaskFactoriesExceptionMessage));
-                                                                return new ConcurrentBag<Task>(new[] {innerTaskCompletionSource.Task});
-                                                            }
+                                    return eventHandlerTaskFactories;
+                                })
+                            .SelectMany(
+                                p =>
+                                    {
+                                        if (p == null)
+                                        {
+                                            var innerTaskCompletionSource = new TaskCompletionSource<Task>();
+                                            innerTaskCompletionSource.SetException(new Exception(FailedToGetEventHandlerTaskFactoriesExceptionMessage));
+                                            return new ConcurrentBag<Task>(new[] {innerTaskCompletionSource.Task});
+                                        }
 
-                                                            return new ConcurrentBag<Task>(
-                                                                p.EventHandlerTaskFactories
-                                                                 .Select(
-                                                                     q => ((Func<Task<TEvent>, Task>) q)(eventDataTask)));
-                                                        }))
-                                            .ToArray(),
-                                        taskCompletionSource.SetResult);
-                                }
-                                else
-                                {
-                                    taskCompletionSource.SetException(new Exception(SubscribersNotFoundExceptionMessage));
-                                }
-                            }
-                            else
-                            {
-                                taskCompletionSource.SetException(new Exception(SubscribersNotFoundExceptionMessage));
-                            }
-                        }
-                        else
-                        {
-                            taskCompletionSource.SetException(new Exception(EventTypeNotFoundExceptionMessage));
-                        }
-                    });
+                                        return new ConcurrentBag<Task>(p.Select(q => ((Func<Task<TEvent>, Task>) q)(eventDataTask)));
+                                    }))
+                        .ToArray(),
+                    taskCompletionSource.SetResult);
+            }
+            else
+            {
+                // No event subscribers was found
+                taskCompletionSource.SetResult(new Task[] {});
+            }
 
             return taskCompletionSource.Task;
         }
 
-        public Task Subscribe<TEvent>(object sender, Func<Task<TEvent>, Task> eventHandlerTaskFactory)
+        /// <summary>
+        ///     Subscribes on an event.
+        /// </summary>
+        /// <typeparam name="TEvent">Event type.</typeparam>
+        /// <param name="sender">Receiver of the event.</param>
+        /// <param name="eventHandlerTaskFactory">Event handler.</param>
+        /// <exception cref="T:System.ArgumentNullException">
+        ///     <paramref name="sender" /> is a null reference (Nothing in Visual Basic).-or-
+        ///     <paramref name="eventHandlerTaskFactory" />
+        ///     is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        public void Subscribe<TEvent>(object sender, Func<Task<TEvent>, Task> eventHandlerTaskFactory)
         {
-            var taskCompletionSource = new TaskCompletionSource<object>();
+            if (sender == null)
+            {
+                throw new ArgumentNullException("sender");
+            }
 
-            _factory.StartNew(
-                () =>
-                    {
-                        ConcurrentDictionary<object, ConcurrentBag<object>> subscribers;
-                        ConcurrentBag<object> eventHandlerTaskFactories;
+            if (eventHandlerTaskFactory == null)
+            {
+                throw new ArgumentNullException("eventHandlerTaskFactory");
+            }
 
-                        Type eventType = typeof (TEvent);
+            Type eventType = typeof (TEvent);
 
-                        if (_hub.ContainsKey(eventType))
-                        {
-                            if (_hub.TryGetValue(eventType, out subscribers))
-                            {
-                                if (subscribers.ContainsKey(sender))
-                                {
-                                    if (subscribers.TryGetValue(sender, out eventHandlerTaskFactories))
-                                    {
-                                        eventHandlerTaskFactories.Add(eventHandlerTaskFactory);
-                                        taskCompletionSource.SetResult(null);
-                                    }
-                                    else
-                                    {
-                                        taskCompletionSource.SetException(new Exception(FailedToGetEventHandlerTaskFactoriesExceptionMessage));
-                                    }
-                                }
-                                else
-                                {
-                                    eventHandlerTaskFactories = new ConcurrentBag<object>();
+            // Gets an subscribers list
+            ConcurrentDictionary<object, ConcurrentBag<object>> subscribers = _hub.GetOrAdd(eventType, type => new ConcurrentDictionary<object, ConcurrentBag<object>>());
 
-                                    if (subscribers.TryAdd(sender, eventHandlerTaskFactories))
-                                    {
-                                        eventHandlerTaskFactories.Add(eventHandlerTaskFactory);
-                                        taskCompletionSource.SetResult(null);
-                                    }
-                                    else
-                                    {
-                                        taskCompletionSource.SetException(new Exception(FailedToAddEventHandlerTaskFactoriesExceptionMessage));
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                taskCompletionSource.SetException(new Exception(FailedToGetSubscribersExceptionMessage));
-                            }
-                        }
-                        else
-                        {
-                            subscribers = new ConcurrentDictionary<object, ConcurrentBag<object>>();
+            // Gets event handlers list
+            ConcurrentBag<object> eventHandlerTaskFactories = subscribers.GetOrAdd(sender, o => new ConcurrentBag<object>());
 
-                            if (_hub.TryAdd(eventType, subscribers))
-                            {
-                                eventHandlerTaskFactories = new ConcurrentBag<object>();
-
-                                if (subscribers.TryAdd(sender, eventHandlerTaskFactories))
-                                {
-                                    eventHandlerTaskFactories.Add(eventHandlerTaskFactory);
-                                    taskCompletionSource.SetResult(null);
-                                }
-                                else
-                                {
-                                    taskCompletionSource.SetException(new Exception(FailedToAddEventHandlerTaskFactoriesExceptionMessage));
-                                }
-                            }
-                            else
-                            {
-                                taskCompletionSource.SetException(new Exception(FailedToAddSubscribersExceptionMessage));
-                            }
-                        }
-                    });
-
-            return taskCompletionSource.Task;
+            // Adds event handler
+            eventHandlerTaskFactories.Add(eventHandlerTaskFactory);
         }
 
-        public Task Unsubscribe<TEvent>(object sender)
+        /// <summary>
+        ///     Unsubscribes from an event.
+        /// </summary>
+        /// <typeparam name="TEvent">Event type.</typeparam>
+        /// <param name="sender">Receiver of the event.</param>
+        /// <exception cref="T:System.ArgumentNullException">
+        ///     <paramref name="sender" /> is a null reference (Nothing in Visual Basic).
+        /// </exception>
+        public void Unsubscribe<TEvent>(object sender)
         {
-            var taskCompletionSource = new TaskCompletionSource<object>();
+            if (sender == null)
+            {
+                throw new ArgumentNullException("sender");
+            }
 
-            _factory.StartNew(
-                () =>
-                    {
-                        Type eventType = typeof (TEvent);
+            Type eventType = typeof (TEvent);
 
-                        if (_hub.ContainsKey(eventType))
-                        {
-                            ConcurrentDictionary<object, ConcurrentBag<object>> subscribers;
+            ConcurrentDictionary<object, ConcurrentBag<object>> subscribers;
 
-                            if (_hub.TryGetValue(eventType, out subscribers))
-                            {
-                                if (subscribers == null)
-                                {
-                                    taskCompletionSource.SetException(new Exception(FailedToGetSubscribersExceptionMessage));
-                                }
-                                else
-                                {
-                                    if (subscribers.ContainsKey(sender))
-                                    {
-                                        ConcurrentBag<object> eventHandlerTaskFactories;
+            // Try to get event subscribers
+            if (_hub.TryGetValue(eventType, out subscribers) && subscribers != null)
+            {
+                ConcurrentBag<object> eventHandlerTaskFactories;
 
-                                        if (subscribers.TryRemove(sender, out eventHandlerTaskFactories))
-                                        {
-                                            taskCompletionSource.SetResult(null);
-                                        }
-                                        else
-                                        {
-                                            taskCompletionSource.SetException(new Exception(FailedToRemoveEventHandlerTaskFactories));
-                                        }
-                                    }
-                                    else
-                                    {
-                                        taskCompletionSource.SetException(new Exception(FailedToGetEventHandlerTaskFactoriesExceptionMessage));
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                taskCompletionSource.SetException(new Exception(FailedToGetSubscribersExceptionMessage));
-                            }
-                        }
-                        else
-                        {
-                            taskCompletionSource.SetException(new Exception(EventTypeNotFoundExceptionMessage));
-                        }
-                    });
-
-            return taskCompletionSource.Task;
+                // Try to remove receiver subscriptions
+                if (!subscribers.TryRemove(sender, out eventHandlerTaskFactories))
+                {
+                    throw new Exception(FailedToRemoveEventHandlerTaskFactories);
+                }
+            }
+            else
+            {
+                throw new Exception(FailedToGetSubscribersExceptionMessage);
+            }
         }
     }
 }

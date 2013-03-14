@@ -28,7 +28,7 @@ namespace AsyncEventAggregatorExamples
                     {
                         Console.Write("Ping... ");
                         await Task.Delay(250);
-                        await p1.Publish(new Pong().AsTask());
+                        await p1.Publish(new Pong());
                     });
 
             p2.Subscribe<Pong>(
@@ -36,10 +36,10 @@ namespace AsyncEventAggregatorExamples
                     {
                         Console.WriteLine("Pong!");
                         await Task.Delay(500);
-                        await p2.Publish(new Ping().AsTask());
+                        await p2.Publish(new Ping());
                     });
 
-            p2.Publish(new Ping().AsTask());
+            p2.Publish(new Ping());
 
             Console.ReadLine();
 
